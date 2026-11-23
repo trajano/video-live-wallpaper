@@ -1,14 +1,20 @@
 package io.github.codeg0blin.videowallpaper
 
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.media.MediaPlayer
 import android.media.PlaybackParams
 import android.net.Uri
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.UserManager
 import android.service.wallpaper.WallpaperService
 import android.util.Log
 import android.view.SurfaceHolder
+import androidx.core.content.ContextCompat
 import androidx.preference.PreferenceManager
 import java.io.IOException
 
@@ -31,10 +37,28 @@ class VideoWallpaperService : WallpaperService() {
         @Volatile
         private var visible = false
 
-        // Counts consecutive prepare attempts that ended in a "transient"
-        // error in a row, so a genuinely broken source (not just a one-off
-        // state-machine hiccup) can't retry forever and spin the CPU.
-        private var consecutiveErrorRetries = 0
+        // A missing grant or unreadable video during reboot must not erase
+        // the selection. Retry a bounded number of times while visible.
+        private val recoveryHandler = Handler(mainLooper)
+        private var recoveryNeeded = false
+        private var recoveryAttempts = 0
+        private var surfaceInitialized = false
+        private var videoPrepared = false
+        @Volatile
+        private var waitingForVideoFrame = false
+        private val recoveryRunnable = Runnable {
+            if (visible && surfaceInitialized) currentHolder?.let { preparePlayer(it) }
+        }
+        private val unlockReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action != Intent.ACTION_USER_UNLOCKED) return
+                if (this@VideoWallpaperService.getSystemService(UserManager::class.java)?.isUserUnlocked == false) return
+                // CE storage and document providers may now be available.
+                recoveryAttempts = 0
+                if (surfaceInitialized) currentHolder?.let { preparePlayer(it) }
+            }
+        }
+        private var unlockReceiverRegistered = false
 
         // Tracks whether *we* believe the player is currently started, kept
         // independently of MediaPlayer.isPlaying(). On some OEM MediaPlayer
@@ -116,12 +140,22 @@ class VideoWallpaperService : WallpaperService() {
             super.onCreate(surfaceHolder)
             prefs = PreferenceManager.getDefaultSharedPreferences(this@VideoWallpaperService)
             prefs?.registerOnSharedPreferenceChangeListener(this)
+            ContextCompat.registerReceiver(
+                this@VideoWallpaperService,
+                unlockReceiver,
+                IntentFilter(Intent.ACTION_USER_UNLOCKED),
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+            unlockReceiverRegistered = true
         }
 
         override fun onSurfaceCreated(holder: SurfaceHolder) {
             super.onSurfaceCreated(holder)
             currentHolder = holder
-            consecutiveErrorRetries = 0
+            surfaceInitialized = false
+            recoveryAttempts = 0
+            recoveryNeeded = false
+            recoveryHandler.removeCallbacks(recoveryRunnable)
 
             val thread = HandlerThread("VideoFrameRenderer").also { it.start() }
             renderThread = thread
@@ -138,6 +172,19 @@ class VideoWallpaperService : WallpaperService() {
                     // docs), so hop back onto our own render thread via
                     // renderHandler before touching the renderer/GL state.
                     r.onFrameAvailableListener = {
+                        if (waitingForVideoFrame) {
+                            val generation = prepareGeneration
+                            recoveryHandler.post {
+                                if (generation == prepareGeneration && videoPrepared && waitingForVideoFrame) {
+                                    waitingForVideoFrame = false
+                                    // A brief playable period avoids resetting the retry
+                                    // limit for decoders that fail right after prepare.
+                                    recoveryHandler.postDelayed({
+                                        if (generation == prepareGeneration && videoPrepared) recoverySucceeded()
+                                    }, STABLE_PLAYBACK_MS)
+                                }
+                            }
+                        }
                         renderHandler?.post(drawFrameRunnable)
                     }
                 } else {
@@ -149,8 +196,11 @@ class VideoWallpaperService : WallpaperService() {
                 // block runs on the render thread while preparePlayer()
                 // touches MediaPlayer, which needs to stay on the main
                 // thread. Post back to main rather than calling directly.
-                android.os.Handler(mainLooper).post {
-                    preparePlayer(holder)
+                recoveryHandler.post {
+                    if (currentHolder === holder) {
+                        surfaceInitialized = true
+                        preparePlayer(holder)
+                    }
                 }
             }
         }
@@ -159,8 +209,12 @@ class VideoWallpaperService : WallpaperService() {
             visible = isVisible
             if (isVisible) {
                 startDrawLoopIfVisible()
+                if (recoveryNeeded && surfaceInitialized) {
+                    currentHolder?.let { preparePlayer(it) }
+                }
             } else {
                 stopDrawLoop()
+                recoveryHandler.removeCallbacks(recoveryRunnable)
             }
             renderHandler?.post {
                 if (isVisible) gifPlayer?.start() else gifPlayer?.pause()
@@ -176,7 +230,7 @@ class VideoWallpaperService : WallpaperService() {
             // Adreno/TCL) turn into error -38. Funneling everything through
             // applySpeed keeps state transitions to one guarded path.
             val speed = prefs?.getFloat(PREF_PLAYBACK_SPEED, DEFAULT_SPEED) ?: DEFAULT_SPEED
-            applySpeed(player, speed)
+            if (videoPrepared) applySpeed(player, speed)
         }
 
         override fun onSurfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -192,12 +246,20 @@ class VideoWallpaperService : WallpaperService() {
         override fun onSurfaceDestroyed(holder: SurfaceHolder) {
             super.onSurfaceDestroyed(holder)
             currentHolder = null
+            surfaceInitialized = false
+            recoveryNeeded = false
+            recoveryHandler.removeCallbacks(recoveryRunnable)
             releasePlayer()
             releaseRenderer()
         }
 
         override fun onDestroy() {
             super.onDestroy()
+            if (unlockReceiverRegistered) {
+                this@VideoWallpaperService.unregisterReceiver(unlockReceiver)
+                unlockReceiverRegistered = false
+            }
+            recoveryHandler.removeCallbacks(recoveryRunnable)
             prefs?.unregisterOnSharedPreferenceChangeListener(this)
             releasePlayer()
             releaseRenderer()
@@ -254,13 +316,46 @@ class VideoWallpaperService : WallpaperService() {
                     }
                 }
                 PREF_VIDEO_URI -> {
+                    recoveryAttempts = 0
                     preparePlayer(holder)
                 }
             }
         }
 
+        private fun scheduleRecovery() {
+            recoveryNeeded = true
+            if (!visible || !surfaceInitialized) return
+            if (this@VideoWallpaperService.getSystemService(UserManager::class.java)?.isUserUnlocked == false) return
+            if (recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+                Log.e(TAG, "Wallpaper still unavailable after $MAX_RECOVERY_ATTEMPTS retries; " +
+                        "waiting for another unlock or visibility change")
+                return
+            }
+            val delayMs = (INITIAL_RETRY_DELAY_MS shl recoveryAttempts.coerceAtMost(5))
+                .coerceAtMost(MAX_RETRY_DELAY_MS)
+            recoveryAttempts++
+            recoveryHandler.removeCallbacks(recoveryRunnable)
+            recoveryHandler.postDelayed(recoveryRunnable, delayMs)
+            Log.w(TAG, "Wallpaper source unavailable; retry $recoveryAttempts/" +
+                    "$MAX_RECOVERY_ATTEMPTS in $delayMs ms")
+        }
+
+        private fun recoverySucceeded() {
+            recoveryHandler.removeCallbacks(recoveryRunnable)
+            recoveryNeeded = false
+            recoveryAttempts = 0
+        }
+
         private fun preparePlayer(holder: SurfaceHolder) {
+            recoveryHandler.removeCallbacks(recoveryRunnable)
+            recoveryNeeded = false
             releasePlayer()
+
+            if (this@VideoWallpaperService.getSystemService(UserManager::class.java)?.isUserUnlocked == false) {
+                // Only ACTION_USER_UNLOCKED should restart this pre-unlock attempt.
+                recoveryNeeded = true
+                return
+            }
 
             val uriString = prefs?.getString(PREF_VIDEO_URI, null)
             if (uriString.isNullOrBlank()) return
@@ -285,8 +380,8 @@ class VideoWallpaperService : WallpaperService() {
                 false
             }
             if (!stillGranted) {
-                Log.w(TAG, "Lost read permission for stored video URI — clearing selection")
-                prefs?.edit()?.remove(PREF_VIDEO_URI)?.apply()
+                Log.w(TAG, "Wallpaper URI read grant unavailable; keeping saved selection")
+                scheduleRecovery()
                 return
             }
 
@@ -297,6 +392,7 @@ class VideoWallpaperService : WallpaperService() {
 
             try {
                 val player = MediaPlayer()
+                mediaPlayer = player
                 player.setDataSource(applicationContext, uri)
                 // Target the renderer's input Surface (backed by a
                 // SurfaceTexture), not holder.surface directly. MediaPlayer
@@ -319,48 +415,27 @@ class VideoWallpaperService : WallpaperService() {
                 player.isLooping = true
                 player.setVolume(0f, 0f) // wallpapers should be silent
                 player.setOnPreparedListener {
-                    consecutiveErrorRetries = 0
+                    if (mediaPlayer !== it) return@setOnPreparedListener
+                    videoPrepared = true
+                    // A successful prepare is not proof that a frame can
+                    // be decoded. Confirm recovery on the first video frame.
+                    waitingForVideoFrame = true
                     applySpeed(it, speed)
                     startDrawLoopIfVisible()
                 }
-                player.setOnErrorListener { _, what, extra ->
-                    Log.e(TAG, "MediaPlayer error: what=$what extra=$extra")
-                    // The player is unusable after any error — it's stuck in
-                    // MEDIA_PLAYER_STATE_ERROR and further start()/pause() calls
-                    // against it (e.g. from a later onVisibilityChanged) will just
-                    // keep re-triggering the same error in a loop. Release it and
-                    // clear the reference immediately so nothing else can touch
-                    // this broken instance; only preparePlayer() (triggered here
-                    // for the source-error case, or by the next onSurfaceCreated/
-                    // pref change) creates a new, working one.
-                    releasePlayer()
-                    // Not every MediaPlayer error means the file itself is bad —
-                    // state-machine hiccups (e.g. what=-38, MEDIA_ERROR_UNSUPPORTED
-                    // from an out-of-order start/pause call) are transient and a
-                    // fresh preparePlayer() call will recover fine. Only clear the
-                    // stored selection for errors that mean the source itself is
-                    // unusable, so we don't wipe a perfectly good video over a
-                    // one-off playback glitch.
-                    if (what == MediaPlayer.MEDIA_ERROR_UNKNOWN || what == -38) {
-                        consecutiveErrorRetries++
-                        if (consecutiveErrorRetries <= MAX_CONSECUTIVE_ERROR_RETRIES) {
-                            Log.w(TAG, "Transient MediaPlayer error — retrying prepare " +
-                                    "($consecutiveErrorRetries/$MAX_CONSECUTIVE_ERROR_RETRIES), selection kept")
-                            currentHolder?.let { preparePlayer(it) }
-                        } else {
-                            Log.e(TAG, "Gave up after $MAX_CONSECUTIVE_ERROR_RETRIES consecutive " +
-                                    "errors — leaving selection intact but not retrying further")
-                        }
-                    } else {
-                        prefs?.edit()?.remove(PREF_VIDEO_URI)?.apply()
+                player.setOnErrorListener { failedPlayer, what, extra ->
+                    if (mediaPlayer === failedPlayer) {
+                        Log.e(TAG, "MediaPlayer error: what=$what extra=$extra")
+                        releasePlayer()
+                        scheduleRecovery()
                     }
                     true
                 }
                 player.prepareAsync()
-                mediaPlayer = player
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to prepare video wallpaper", e)
-                prefs?.edit()?.remove(PREF_VIDEO_URI)?.apply()
+                Log.e(TAG, "Failed to prepare video wallpaper; keeping selection", e)
+                releasePlayer()
+                scheduleRecovery()
             }
         }
 
@@ -382,15 +457,15 @@ class VideoWallpaperService : WallpaperService() {
                 val gif = try {
                     GifDecoder.parse(GifFiles.readBytes(applicationContext.contentResolver, uri))
                 } catch (e: GifFormatException) {
-                    // The file itself is unusable — same treatment as a bad video source.
-                    Log.e(TAG, "Selected GIF could not be decoded — clearing selection", e)
-                    prefs?.edit()?.remove(PREF_VIDEO_URI)?.apply()
+                    Log.e(TAG, "Selected GIF could not be decoded; keeping selection", e)
                     return@post
                 } catch (e: IOException) {
-                    Log.e(TAG, "Could not read selected GIF — keeping selection", e)
+                    Log.e(TAG, "Could not read selected GIF; retrying", e)
+                    retryGifIfCurrent(generation)
                     return@post
                 } catch (e: SecurityException) {
-                    Log.e(TAG, "No permission to read selected GIF — keeping selection", e)
+                    Log.e(TAG, "No permission to read selected GIF; retrying", e)
+                    retryGifIfCurrent(generation)
                     return@post
                 } catch (e: OutOfMemoryError) {
                     Log.e(TAG, "Out of memory loading selected GIF — keeping selection", e)
@@ -402,6 +477,15 @@ class VideoWallpaperService : WallpaperService() {
                 player.setSpeed(speed)
                 gifPlayer = player
                 if (visible) player.start()
+                recoveryHandler.post {
+                    if (generation == prepareGeneration) recoverySucceeded()
+                }
+            }
+        }
+
+        private fun retryGifIfCurrent(generation: Int) {
+            recoveryHandler.post {
+                if (generation == prepareGeneration) scheduleRecovery()
             }
         }
 
@@ -530,6 +614,8 @@ class VideoWallpaperService : WallpaperService() {
                 it.release()
             }
             mediaPlayer = null
+            videoPrepared = false
+            waitingForVideoFrame = false
             weBelieveStarted = false
             appliedSpeed = 1.0f
         }
@@ -537,7 +623,10 @@ class VideoWallpaperService : WallpaperService() {
 
     companion object {
         private const val TAG = "VideoWallpaperService"
-        private const val MAX_CONSECUTIVE_ERROR_RETRIES = 3
+        private const val MAX_RECOVERY_ATTEMPTS = 10
+        private const val INITIAL_RETRY_DELAY_MS = 2_000L
+        private const val MAX_RETRY_DELAY_MS = 30_000L
+        private const val STABLE_PLAYBACK_MS = 5_000L
         const val PREF_VIDEO_URI = "selected_video_uri"
         const val PREF_PLAYBACK_SPEED = "playback_speed"
         const val PREF_SCALING_MODE = "scaling_mode"

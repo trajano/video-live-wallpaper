@@ -52,6 +52,7 @@ class VideoFrameRenderer {
     private var texCoordHandle: Int = -1
     private var textureUniformHandle: Int = -1
     private var texMatrixHandle: Int = -1
+    private var tiltUniformHandle: Int = -1
 
     // SurfaceTexture's transform for the latest video frame. It carries the
     // video's rotation tag (portrait phone clips are usually stored sideways
@@ -78,6 +79,7 @@ class VideoFrameRenderer {
     private var gifPositionHandle: Int = -1
     private var gifTexCoordHandle: Int = -1
     private var gifTextureUniformHandle: Int = -1
+    private var gifTiltUniformHandle: Int = -1
     private var gifTextureId: Int = 0
     private var gifBitmap: Bitmap? = null
     private var gifTextureWidth: Int = 0
@@ -95,6 +97,10 @@ class VideoFrameRenderer {
     private var lastViewportWidth: Int = 0
     private var lastViewportHeight: Int = 0
     private var lastScalingMode: ScalingMode? = null
+
+    // Render-thread only. Defaults preserve the original, non-tilted quad.
+    private var tiltX = 0f
+    private var tiltY = 0f
 
     // Set when a new frame has arrived and not yet been drawn. Chunk 2 only
     // logs on this; drawing happens in a later chunk. Volatile because
@@ -255,6 +261,12 @@ class VideoFrameRenderer {
         scalingMode = mode
     }
 
+    /** Rotation about the horizontal and vertical axes, in radians. Render thread only. */
+    fun setPerspectiveTilt(pitchRadians: Float, rollRadians: Float) {
+        tiltX = pitchRadians
+        tiltY = rollRadians
+    }
+
     /**
      * Draws the current video frame, cropped or letterboxed per the current
      * scaling mode, and presents it. [videoWidth]/[videoHeight] should come
@@ -291,6 +303,7 @@ class VideoFrameRenderer {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
         GLES20.glUseProgram(shaderProgram)
+        GLES20.glUniform2f(tiltUniformHandle, tiltX, tiltY)
         GLES20.glUniformMatrix4fv(texMatrixHandle, 1, false, texMatrix, 0)
 
         val buffer = vertexBuffer ?: return
@@ -449,7 +462,8 @@ class VideoFrameRenderer {
         texCoordHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
         textureUniformHandle = GLES20.glGetUniformLocation(program, "uTexture")
         texMatrixHandle = GLES20.glGetUniformLocation(program, "uTexMatrix")
-        if (positionHandle < 0 || texCoordHandle < 0 || textureUniformHandle < 0 || texMatrixHandle < 0) {
+        tiltUniformHandle = GLES20.glGetUniformLocation(program, "uTilt")
+        if (positionHandle < 0 || texCoordHandle < 0 || textureUniformHandle < 0 || texMatrixHandle < 0 || tiltUniformHandle < 0) {
             Log.e(TAG, "Failed to get shader attribute/uniform locations")
             return false
         }
@@ -578,6 +592,7 @@ class VideoFrameRenderer {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
         GLES20.glUseProgram(gifProgram)
+        GLES20.glUniform2f(gifTiltUniformHandle, tiltX, tiltY)
 
         val buffer = vertexBuffer ?: return
         buffer.position(0)
@@ -638,7 +653,8 @@ class VideoFrameRenderer {
         val pos = GLES20.glGetAttribLocation(program, "aPosition")
         val tex = GLES20.glGetAttribLocation(program, "aTexCoord")
         val uni = GLES20.glGetUniformLocation(program, "uTexture")
-        if (pos < 0 || tex < 0 || uni < 0) {
+        val tilt = GLES20.glGetUniformLocation(program, "uTilt")
+        if (pos < 0 || tex < 0 || uni < 0 || tilt < 0) {
             Log.e(TAG, "Failed to get GIF shader attribute/uniform locations")
             GLES20.glDeleteProgram(program)
             return false
@@ -647,6 +663,7 @@ class VideoFrameRenderer {
         gifPositionHandle = pos
         gifTexCoordHandle = tex
         gifTextureUniformHandle = uni
+        gifTiltUniformHandle = tilt
         return true
     }
 
@@ -692,6 +709,7 @@ class VideoFrameRenderer {
         gifPositionHandle = -1
         gifTexCoordHandle = -1
         gifTextureUniformHandle = -1
+        gifTiltUniformHandle = -1
         if (shaderProgram != 0) {
             GLES20.glDeleteProgram(shaderProgram)
             shaderProgram = 0
@@ -700,6 +718,7 @@ class VideoFrameRenderer {
         texCoordHandle = -1
         textureUniformHandle = -1
         texMatrixHandle = -1
+        tiltUniformHandle = -1
         vertexBuffer = null
         if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
             EGL14.eglMakeCurrent(
@@ -748,10 +767,20 @@ class VideoFrameRenderer {
         private const val VERTEX_SHADER_SRC = """
             attribute vec2 aPosition;
             attribute vec2 aTexCoord;
+            uniform vec2 uTilt;
             varying vec2 vTexCoord;
             void main() {
-                gl_Position = vec4(aPosition, 0.0, 1.0);
-                vTexCoord = aTexCoord;
+                // Keep the quad covering the viewport at every angle. Varying
+                // clip W adds perspective-correct texture interpolation with
+                // no extra fragment shader work and no disappearing corners.
+                float pitch = sin(uTilt.x);
+                float yaw = sin(uTilt.y);
+                float zoom = 1.0 + 0.16 * max(abs(pitch), abs(yaw));
+                float depth = 1.0 + 0.30 * (aPosition.x * yaw + aPosition.y * pitch);
+                vec2 uv = vec2(0.5) + (aTexCoord - vec2(0.5)) / zoom
+                    + 0.08 * vec2(yaw, pitch);
+                gl_Position = vec4(aPosition * depth, 0.0, depth);
+                vTexCoord = uv;
             }
         """
 
@@ -766,10 +795,17 @@ class VideoFrameRenderer {
             attribute vec2 aPosition;
             attribute vec2 aTexCoord;
             uniform mat4 uTexMatrix;
+            uniform vec2 uTilt;
             varying vec2 vTexCoord;
             void main() {
-                gl_Position = vec4(aPosition, 0.0, 1.0);
-                vTexCoord = (uTexMatrix * vec4(aTexCoord.x, 1.0 - aTexCoord.y, 0.0, 1.0)).xy;
+                float pitch = sin(uTilt.x);
+                float yaw = sin(uTilt.y);
+                float zoom = 1.0 + 0.16 * max(abs(pitch), abs(yaw));
+                float depth = 1.0 + 0.30 * (aPosition.x * yaw + aPosition.y * pitch);
+                vec2 uv = vec2(0.5) + (aTexCoord - vec2(0.5)) / zoom
+                    + 0.08 * vec2(yaw, pitch);
+                gl_Position = vec4(aPosition * depth, 0.0, depth);
+                vTexCoord = (uTexMatrix * vec4(uv.x, 1.0 - uv.y, 0.0, 1.0)).xy;
             }
         """
 

@@ -13,13 +13,17 @@ import android.os.Handler
 import android.os.Looper
 import android.view.View
 import android.view.Gravity
+import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.ImageView
 import android.widget.SeekBar
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.preference.PreferenceManager
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import io.github.codeg0blin.videowallpaper.R
 import io.github.codeg0blin.videowallpaper.VideoWallpaperService
 import io.github.codeg0blin.videowallpaper.databinding.ActivityMainBinding
@@ -83,6 +87,7 @@ class MainActivity : AppCompatActivity() {
 
         setupSpeedControl()
         setupCropControl()
+        setupPerspectiveControls()
         restoreSelection()
 
         binding.pickButton.setOnClickListener {
@@ -182,6 +187,86 @@ class MainActivity : AppCompatActivity() {
             // apparent once actually set as a wallpaper. We still persist it
             // here so the wallpaper service picks it up immediately.
         }
+    }
+
+    // --- Perspective Zoom -------------------------------------------------
+
+    private fun setupPerspectiveControls() {
+        val enabled = prefs.getBoolean(VideoWallpaperService.PREF_PERSPECTIVE_ENABLED, false)
+        binding.perspectiveSwitch.isChecked = enabled
+        binding.tiltSettingsButton.isEnabled = enabled
+        updateTiltSettingsLabel()
+        binding.perspectiveSwitch.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putBoolean(VideoWallpaperService.PREF_PERSPECTIVE_ENABLED, checked).apply()
+            binding.tiltSettingsButton.isEnabled = checked
+        }
+        binding.tiltSettingsButton.setOnClickListener { showTiltSettings() }
+    }
+
+    private fun updateTiltSettingsLabel() {
+        val angle = prefs.getInt(
+            VideoWallpaperService.PREF_MAX_TILT_DEGREES,
+            VideoWallpaperService.DEFAULT_MAX_TILT_DEGREES
+        ).coerceIn(1, VideoWallpaperService.MAX_TILT_DEGREES)
+        binding.tiltSettingsButton.text = getString(R.string.tilt_button_format, angle)
+    }
+
+    private fun showTiltSettings() {
+        val padding = (20f * resources.displayMetrics.density).roundToInt()
+        val angleText = TextView(this).apply {
+            setTextColor(getColor(R.color.text_primary))
+            textSize = 16f
+        }
+        val slider = SeekBar(this).apply {
+            min = 1 // minSdk 26
+            max = VideoWallpaperService.MAX_TILT_DEGREES
+            progress = prefs.getInt(
+                VideoWallpaperService.PREF_MAX_TILT_DEGREES,
+                VideoWallpaperService.DEFAULT_MAX_TILT_DEGREES
+            ).coerceIn(1, max)
+        }
+        angleText.text = getString(R.string.tilt_angle_format, slider.progress)
+        slider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                val angle = progress.coerceIn(1, VideoWallpaperService.MAX_TILT_DEGREES)
+                angleText.text = getString(R.string.tilt_angle_format, angle)
+                prefs.edit().putInt(VideoWallpaperService.PREF_MAX_TILT_DEGREES, angle).apply()
+                updateTiltSettingsLabel()
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+            override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+        })
+        val standard = Button(this).apply {
+            text = getString(R.string.tilt_preset_standard)
+            setOnClickListener { slider.progress = VideoWallpaperService.DEFAULT_MAX_TILT_DEGREES }
+        }
+        val extreme = Button(this).apply {
+            text = getString(R.string.tilt_preset_extreme)
+            setOnClickListener { slider.progress = VideoWallpaperService.EXTREME_TILT_DEGREES }
+        }
+        val presets = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(standard, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(extreme, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        val hint = TextView(this).apply {
+            text = getString(R.string.tilt_explanation)
+            setTextColor(getColor(R.color.text_secondary))
+            textSize = 12f
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(padding, padding, padding, padding)
+            addView(angleText)
+            addView(slider)
+            addView(presets)
+            addView(hint)
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.perspective_zoom)
+            .setView(content)
+            .setPositiveButton(android.R.string.ok, null)
+            .show()
     }
 
     // --- Video selection -------------------------------------------------

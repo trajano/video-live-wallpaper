@@ -198,6 +198,41 @@
 
     </com.google.android.material.button.MaterialButtonToggleGroup>
 
+    <!-- Perspective effect toggle and maximum-angle settings -->
+    <LinearLayout
+        android:id="@+id/perspectiveRow"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/cropToggleGroup">
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/perspectiveSwitch"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/perspective_zoom"
+            android:textColor="@color/text_primary"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/tiltSettingsButton"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="wrap_content"
+            android:layout_height="40dp"
+            android:insetTop="0dp"
+            android:insetBottom="0dp"
+            android:text="@string/tilt_button_default"
+            android:textColor="@color/text_primary"
+            android:textSize="12sp"
+            app:strokeColor="@color/accent" />
+
+    </LinearLayout>
+
     <Button
         android:id="@+id/setWallpaperButton"
         android:layout_width="0dp"
@@ -214,6 +249,6 @@
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintTop_toBottomOf="@id/cropToggleGroup" />
+        app:layout_constraintTop_toBottomOf="@id/perspectiveRow" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>

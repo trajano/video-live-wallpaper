@@ -5,11 +5,16 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.media.MediaPlayer
 import android.media.PlaybackParams
 import android.net.Uri
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.os.UserManager
 import android.service.wallpaper.WallpaperService
 import android.util.Log
@@ -17,6 +22,7 @@ import android.view.SurfaceHolder
 import androidx.core.content.ContextCompat
 import androidx.preference.PreferenceManager
 import java.io.IOException
+import kotlin.math.abs
 
 /**
  * Renders the user's chosen video as a looping live wallpaper.
@@ -29,7 +35,7 @@ class VideoWallpaperService : WallpaperService() {
 
     override fun onCreateEngine(): Engine = VideoEngine()
 
-    inner class VideoEngine : Engine(), SharedPreferences.OnSharedPreferenceChangeListener {
+    inner class VideoEngine : Engine(), SharedPreferences.OnSharedPreferenceChangeListener, SensorEventListener {
 
         private var mediaPlayer: MediaPlayer? = null
         private var prefs: SharedPreferences? = null
@@ -93,6 +99,21 @@ class VideoWallpaperService : WallpaperService() {
         private var renderThread: HandlerThread? = null
         private var renderHandler: Handler? = null
 
+        // All sensor callbacks and preference writes are handled on the main
+        // thread; EGL and frame drawing remain on renderHandler's thread.
+        private var sensorManager: SensorManager? = null
+        private var tiltSensor: Sensor? = null
+        private var sensorRegistered = false
+        private var basePitch: Float? = null
+        private var baseRoll: Float? = null
+        private var gravityEstimate: FloatArray? = null
+        private var filteredPitch = 0f
+        private var filteredRoll = 0f
+        private var drawnPitch = 0f
+        private var drawnRoll = 0f
+        private var lastTiltDrawAt = 0L
+        private var maxTiltDegrees = DEFAULT_MAX_TILT_DEGREES
+
         // GIF playback (issue #2). gifPlayer is only touched on the render
         // thread; everything that changes it is posted to renderHandler.
         // prepareGeneration is bumped by every releasePlayer() so a GIF load
@@ -140,6 +161,9 @@ class VideoWallpaperService : WallpaperService() {
             super.onCreate(surfaceHolder)
             prefs = PreferenceManager.getDefaultSharedPreferences(this@VideoWallpaperService)
             prefs?.registerOnSharedPreferenceChangeListener(this)
+            sensorManager = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+            tiltSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_GRAVITY)
+                ?: sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
             ContextCompat.registerReceiver(
                 this@VideoWallpaperService,
                 unlockReceiver,
@@ -161,6 +185,7 @@ class VideoWallpaperService : WallpaperService() {
             renderThread = thread
             val handler = Handler(thread.looper)
             renderHandler = handler
+            updateTiltSensor()
             handler.post {
                 val r = VideoFrameRenderer()
                 if (r.start(holder.surface)) {
@@ -207,6 +232,7 @@ class VideoWallpaperService : WallpaperService() {
 
         override fun onVisibilityChanged(isVisible: Boolean) {
             visible = isVisible
+            updateTiltSensor()
             if (isVisible) {
                 startDrawLoopIfVisible()
                 if (recoveryNeeded && surfaceInitialized) {
@@ -245,6 +271,7 @@ class VideoWallpaperService : WallpaperService() {
 
         override fun onSurfaceDestroyed(holder: SurfaceHolder) {
             super.onSurfaceDestroyed(holder)
+            stopTiltSensor()
             currentHolder = null
             surfaceInitialized = false
             recoveryNeeded = false
@@ -255,6 +282,7 @@ class VideoWallpaperService : WallpaperService() {
 
         override fun onDestroy() {
             super.onDestroy()
+            stopTiltSensor()
             if (unlockReceiverRegistered) {
                 this@VideoWallpaperService.unregisterReceiver(unlockReceiver)
                 unlockReceiverRegistered = false
@@ -292,6 +320,10 @@ class VideoWallpaperService : WallpaperService() {
          * or scaling mode mid-playback.
          */
         override fun onSharedPreferenceChanged(sharedPreferences: SharedPreferences?, key: String?) {
+            if (key == PREF_PERSPECTIVE_ENABLED || key == PREF_MAX_TILT_DEGREES) {
+                updateTiltSensor()
+                return
+            }
             val holder = currentHolder ?: return
             when (key) {
                 PREF_PLAYBACK_SPEED -> {
@@ -321,6 +353,91 @@ class VideoWallpaperService : WallpaperService() {
                 }
             }
         }
+
+        /** Register for movement only when the visible wallpaper needs it. */
+        private fun updateTiltSensor() {
+            maxTiltDegrees = (prefs?.getInt(PREF_MAX_TILT_DEGREES, DEFAULT_MAX_TILT_DEGREES)
+                ?: DEFAULT_MAX_TILT_DEGREES).coerceIn(1, MAX_TILT_DEGREES)
+            val enabled = prefs?.getBoolean(PREF_PERSPECTIVE_ENABLED, false) == true
+            if (!enabled || !visible || currentHolder == null) {
+                stopTiltSensor()
+                return
+            }
+            if (sensorRegistered) return
+            val manager = sensorManager ?: return
+            val sensor = tiltSensor ?: return
+            basePitch = null
+            baseRoll = null
+            gravityEstimate = null
+            filteredPitch = 0f
+            filteredRoll = 0f
+            drawnPitch = 0f
+            drawnRoll = 0f
+            lastTiltDrawAt = 0L
+            sensorRegistered = manager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_GAME)
+        }
+
+        private fun stopTiltSensor() {
+            if (sensorRegistered) {
+                sensorManager?.unregisterListener(this)
+                sensorRegistered = false
+            }
+            basePitch = null
+            baseRoll = null
+            gravityEstimate = null
+            filteredPitch = 0f
+            filteredRoll = 0f
+            drawnPitch = 0f
+            drawnRoll = 0f
+            // Reset the last transformation when disabled. Do not re-prepare
+            // MediaPlayer or disturb the fork's unlock/recovery state.
+            renderHandler?.post {
+                renderer?.setPerspectiveTilt(0f, 0f)
+                drawFrameRunnable.run()
+            }
+        }
+
+        override fun onSensorChanged(event: SensorEvent) {
+            if (!sensorRegistered || !visible || event.sensor != tiltSensor) return
+            val values = event.values
+            if (values.size < 3) return
+            val g = if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
+                val estimate = gravityEstimate ?: values.copyOf(3).also { gravityEstimate = it }
+                for (i in 0..2) estimate[i] = estimate[i] * 0.85f + values[i] * 0.15f
+                estimate
+            } else {
+                values
+            }
+            val pitch = TiltMath.pitch(g[1], g[2])
+            val roll = TiltMath.roll(g[0], g[1], g[2])
+            val referencePitch = basePitch
+            val referenceRoll = baseRoll
+            if (referencePitch == null || referenceRoll == null) {
+                // Neutral position is the phone's position when sensing begins.
+                basePitch = pitch
+                baseRoll = roll
+                return
+            }
+            val targetPitch = TiltMath.mapAngle(pitch, referencePitch, maxTiltDegrees)
+            val targetRoll = TiltMath.mapAngle(roll, referenceRoll, maxTiltDegrees)
+            filteredPitch += (targetPitch - filteredPitch) * 0.25f
+            filteredRoll += (targetRoll - filteredRoll) * 0.25f
+            if (abs(filteredPitch - drawnPitch) < 0.001f &&
+                abs(filteredRoll - drawnRoll) < 0.001f) return
+            val now = SystemClock.uptimeMillis()
+            if (now - lastTiltDrawAt < 33L) return
+            lastTiltDrawAt = now
+            drawnPitch = filteredPitch
+            drawnRoll = filteredRoll
+            val x = drawnPitch
+            val y = drawnRoll
+            renderHandler?.post {
+                renderer?.setPerspectiveTilt(x, y)
+                drawFrameRunnable.run()
+            }
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
         private fun scheduleRecovery() {
             recoveryNeeded = true
@@ -630,6 +747,11 @@ class VideoWallpaperService : WallpaperService() {
         const val PREF_VIDEO_URI = "selected_video_uri"
         const val PREF_PLAYBACK_SPEED = "playback_speed"
         const val PREF_SCALING_MODE = "scaling_mode"
+        const val PREF_PERSPECTIVE_ENABLED = "perspective_enabled"
+        const val PREF_MAX_TILT_DEGREES = "perspective_max_tilt_degrees"
+        const val DEFAULT_MAX_TILT_DEGREES = 15
+        const val EXTREME_TILT_DEGREES = 80
+        const val MAX_TILT_DEGREES = 89
         const val DEFAULT_SPEED = 1.0f
         const val DEFAULT_SCALING_MODE = MediaPlayer.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING
     }

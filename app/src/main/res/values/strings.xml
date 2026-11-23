@@ -17,5 +17,12 @@
     <string name="gif_preview_description">Preview of the selected GIF</string>
     <string name="error_gif_unusable">That GIF couldn\'t be loaded. It may be damaged or too large.</string>
     <string name="version_format">v%1$s</string>
+    <string name="perspective_zoom">Perspective Zoom</string>
+    <string name="tilt_button_default">Max 15°</string>
+    <string name="tilt_button_format">Max %1$d°</string>
+    <string name="tilt_angle_format">Maximum perspective tilt: %1$d°</string>
+    <string name="tilt_preset_standard">Standard (15°)</string>
+    <string name="tilt_preset_extreme">Extreme (80°)</string>
+    <string name="tilt_explanation">Tilt your phone to change the viewing angle. At extreme angles, the image may visibly stretch near edges. The effect appears on the wallpaper, not in the in-app preview.</string>
 
 </resources>
